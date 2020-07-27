@@ -20,7 +20,8 @@ package capability
 
 import (
 	"github.com/google/go-cmp/cmp"
-	"math/rand"
+	"k8s.io/apimachinery/pkg/util/rand"
+	"os"
 
 	//"github.com/google/go-cmp/cmp"
 	snapbeta1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
@@ -70,6 +71,8 @@ type fixture struct {
 	// CSI server
 	runCSIServer  bool
 	fakeCSIServer *fakeCSIServer
+	// provisioner of storage
+	provisioner string
 }
 
 func newFixture(t *testing.T, snapshotSupported bool, runCSIServer bool) *fixture {
@@ -77,6 +80,7 @@ func newFixture(t *testing.T, snapshotSupported bool, runCSIServer bool) *fixtur
 		t:                 t,
 		snapshotSupported: snapshotSupported,
 		runCSIServer:      runCSIServer,
+		provisioner: "csi-" + rand.String(8),
 	}
 }
 
@@ -93,6 +97,9 @@ func (f *fixture) newController() (*StorageCapabilityController,
 	ksInformers := ksinformers.NewSharedInformerFactory(f.ksClient, noReSyncPeriodFunc())
 	snapshotInformers := snapinformers.NewSharedInformerFactory(f.snapshotClassClient, noReSyncPeriodFunc())
 
+
+	pluginPath := os.TempDir()
+
 	c := NewController(
 		f.ksClient.StorageV1alpha1().StorageClassCapabilities(),
 		ksInformers.Storage().V1alpha1(),
@@ -101,13 +108,10 @@ func (f *fixture) newController() (*StorageCapabilityController,
 		f.snapshotSupported,
 		f.snapshotClassClient.SnapshotV1beta1().VolumeSnapshotClasses(),
 		snapshotInformers.Snapshot().V1beta1().VolumeSnapshotClasses(),
-		k8sInformers.Storage().V1beta1().CSIDrivers(),
+		pluginPath,
 	)
 	if f.runCSIServer {
-		port := 30000 + rand.Intn(100)
-		fakeCSIServer, address := newTestCSIServer(port)
-		f.fakeCSIServer = fakeCSIServer
-		c.setCSIAddressGetter(func(storageClassProvisioner string) string { return address })
+		f.fakeCSIServer = newTestCSIServer(pluginPath,f.provisioner)
 	}
 
 	for _, storageClass := range f.storageClassLister {
@@ -318,7 +322,7 @@ func getKey(sc *storagev1.StorageClass, t *testing.T) string {
 
 func TestCreateStorageClass(t *testing.T) {
 	fixture := newFixture(t, true, true)
-	storageClass := newStorageClass("csi-example", "csi.example.com")
+	storageClass := newStorageClass("csi-example", fixture.provisioner)
 	storageClassUpdate := storageClass.DeepCopy()
 	storageClassUpdate.Annotations = map[string]string{annotationSupportSnapshot: "true"}
 	snapshotClass := newSnapshotClass(storageClass)
@@ -340,7 +344,8 @@ func TestCreateStorageClass(t *testing.T) {
 }
 
 func TestUpdateStorageClass(t *testing.T) {
-	storageClass := newStorageClass("csi-example", "csi.example.com")
+	fixture := newFixture(t, true, true)
+	storageClass := newStorageClass("csi-example", fixture.provisioner)
 	storageClass.Annotations = map[string]string{annotationSupportSnapshot: "true"}
 	snapshotClass := newSnapshotClass(storageClass)
 	storageClassCapabilityUpdate := newStorageClassCapability(storageClass)
@@ -349,7 +354,6 @@ func TestUpdateStorageClass(t *testing.T) {
 	storageClassCapability.Spec.Features.Volume.Create = !storageClassCapability.Spec.Features.Volume.Create
 	csiDriver := newCSIDriver(storageClass)
 
-	fixture := newFixture(t, true, true)
 	// Object exist
 	fixture.storageObjects = append(fixture.storageObjects, storageClass, csiDriver)
 	fixture.storageClassLister = append(fixture.storageClassLister, storageClass)
@@ -367,13 +371,13 @@ func TestUpdateStorageClass(t *testing.T) {
 }
 
 func TestDeleteStorageClass(t *testing.T) {
-	storageClass := newStorageClass("csi-example", "csi.example.com")
+	fixture := newFixture(t, true, true)
+	storageClass := newStorageClass("csi-example", fixture.provisioner)
 	snapshotClass := newSnapshotClass(storageClass)
 	storageClassCapability := newStorageClassCapability(storageClass)
 
 	csiDriver := newCSIDriver(storageClass)
 
-	fixture := newFixture(t, true, true)
 	// Object exist
 	fixture.storageObjects = append(fixture.storageObjects, csiDriver)
 	fixture.csiDriverLister = append(fixture.csiDriverLister, csiDriver)
@@ -392,7 +396,7 @@ func TestDeleteStorageClass(t *testing.T) {
 
 func TestCreateStorageClassNotSupportSnapshot(t *testing.T) {
 	fixture := newFixture(t, false, true)
-	storageClass := newStorageClass("csi-example", "csi.example.com")
+	storageClass := newStorageClass("csi-example", fixture.provisioner)
 	storageClassUpdate := storageClass.DeepCopy()
 	storageClassUpdate.Annotations = map[string]string{annotationSupportSnapshot: "false"}
 	storageClassCapability := newStorageClassCapability(storageClass)
@@ -418,8 +422,8 @@ func TestCreateStorageClassNotSupportSnapshot(t *testing.T) {
 
 func TestCreateStorageClassInTree(t *testing.T) {
 	// InTree Storage has no snapshot capability
-	fixture := newFixture(t, true, true)
-	storageClass := newStorageClass("csi-example", "csi.example.com")
+	fixture := newFixture(t, true, false)
+	storageClass := newStorageClass("csi-example", fixture.provisioner)
 	storageClassUpdate := storageClass.DeepCopy()
 	storageClassUpdate.Annotations = map[string]string{annotationSupportSnapshot: "false"}
 	storageClassCapability := newStorageClassCapability(storageClass)

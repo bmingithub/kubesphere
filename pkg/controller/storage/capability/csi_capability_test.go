@@ -19,7 +19,6 @@ package capability
 
 import (
 	"context"
-	"fmt"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
@@ -29,7 +28,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -73,16 +71,11 @@ type fakeCSIServer struct {
 	server  *grpc.Server
 }
 
-func newTestCSIServer(port int) (csiServer *fakeCSIServer, address string) {
-	if runtime.GOOS == "windows" {
-		address = fmt.Sprintf("localhost:%d", +port)
-		csiServer = newFakeCSIServer("tcp", address)
-	} else {
-		address = filepath.Join(os.TempDir(), "csi.sock"+rand.String(4))
-		csiServer = newFakeCSIServer("unix", address)
-		address = "unix://" + address
-	}
-	return csiServer, address
+func newTestCSIServer(pluginPath, provisioner string) *fakeCSIServer {
+	csiPath := filepath.Join(pluginPath, provisioner)
+	_ = os.MkdirAll(csiPath, os.ModePerm)
+	address := filepath.Join(csiPath, "csi.sock")
+	return newFakeCSIServer("unix", address)
 }
 
 func newFakeCSIServer(network, address string) *fakeCSIServer {
@@ -152,11 +145,12 @@ func (*fakeCSIServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 }
 
 func Test_CSICapability(t *testing.T) {
-	fakeCSIServer, address := newTestCSIServer(30087)
+	pluginPath, provisioner := os.TempDir(), "csi-" + rand.String(8)
+	fakeCSIServer := newTestCSIServer(pluginPath, provisioner)
 	fakeCSIServer.run()
 	defer fakeCSIServer.stop()
 
-	specGot, err := csiCapability(address)
+	specGot, err := csiCapability(filepath.Join(pluginPath, provisioner, "csi.sock"))
 	if err != nil {
 		t.Error(err)
 	}

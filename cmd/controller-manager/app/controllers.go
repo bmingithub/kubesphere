@@ -142,7 +142,7 @@ func addControllers(
 		capability.SnapshotSupported(client.Kubernetes().Discovery()),
 		client.Snapshot().SnapshotV1beta1().VolumeSnapshotClasses(),
 		informerFactory.SnapshotSharedInformerFactory().Snapshot().V1beta1().VolumeSnapshotClasses(),
-		kubernetesInformer.Storage().V1beta1().CSIDrivers(),
+		capability.PluginPath,
 	)
 
 	volumeExpansionController := expansion.NewVolumeExpansionController(

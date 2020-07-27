@@ -20,30 +20,29 @@ package capability
 
 import (
 	"fmt"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/version"
-	"k8s.io/client-go/discovery"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/client-go/discovery"
 
 	snapshotv1beta1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	snapshotclient "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/clientset/versioned/typed/volumesnapshot/v1beta1"
 	snapinformers "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/informers/externalversions/volumesnapshot/v1beta1"
 	snapshotlisters "github.com/kubernetes-csi/external-snapshotter/v2/pkg/client/listers/volumesnapshot/v1beta1"
 	storagev1 "k8s.io/api/storage/v1"
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	storageinformersv1 "k8s.io/client-go/informers/storage/v1"
-	storageinformersv1beta1 "k8s.io/client-go/informers/storage/v1beta1"
 	"k8s.io/client-go/kubernetes/scheme"
 	storageclient "k8s.io/client-go/kubernetes/typed/storage/v1"
 	storagelistersv1 "k8s.io/client-go/listers/storage/v1"
-	storagelistersv1beta1 "k8s.io/client-go/listers/storage/v1beta1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
@@ -56,11 +55,10 @@ import (
 
 const (
 	minSnapshotSupportedVersion = "v1.17.0"
-	csiAddressFormat            = "/var/lib/kubelet/plugins/%s/csi.sock"
 	annotationSupportSnapshot   = "storageclass.kubesphere.io/support-snapshot"
-)
 
-type csiAddressGetter func(storageClassProvisioner string) string
+	PluginPath = "/var/lib/kubelet/plugins"
+)
 
 type StorageCapabilityController struct {
 	storageClassCapabilityClient capabilityclient.StorageClassCapabilityInterface
@@ -79,10 +77,8 @@ type StorageCapabilityController struct {
 	snapshotClassLister snapshotlisters.VolumeSnapshotClassLister
 	snapshotClassSynced cache.InformerSynced
 
-	csiDriverLister storagelistersv1beta1.CSIDriverLister
-	csiDriverSynced cache.InformerSynced
-
-	csiAddressGetter csiAddressGetter
+	csiWatcher *CSIWatcher
+	pluginPath string
 
 	workQueue workqueue.RateLimitingInterface
 }
@@ -97,7 +93,7 @@ func NewController(
 	snapshotSupported bool,
 	snapshotClassClient snapshotclient.VolumeSnapshotClassInterface,
 	snapshotClassInformer snapinformers.VolumeSnapshotClassInformer,
-	csiDriverInformer storageinformersv1beta1.CSIDriverInformer,
+	pluginPath string,
 ) *StorageCapabilityController {
 
 	utilruntime.Must(crdscheme.AddToScheme(scheme.Scheme))
@@ -112,9 +108,7 @@ func NewController(
 		storageClassLister:           storageClassInformer.Lister(),
 		storageClassSynced:           storageClassInformer.Informer().HasSynced,
 		snapshotSupported:            snapshotSupported,
-		csiDriverLister:              csiDriverInformer.Lister(),
-		csiDriverSynced:              csiDriverInformer.Informer().HasSynced,
-		csiAddressGetter:             csiAddress,
+		pluginPath:                   pluginPath,
 		workQueue:                    workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "StorageClasses"),
 	}
 
@@ -124,6 +118,7 @@ func NewController(
 		controller.snapshotClassSynced = snapshotClassInformer.Informer().HasSynced
 	}
 
+	controller.csiWatcher = NewCSIWatcher(controller.pluginPath, controller.csiWatcherHandler)
 	storageClassInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueStorageClass,
 		UpdateFunc: func(old, new interface{}) {
@@ -136,16 +131,21 @@ func NewController(
 		},
 		DeleteFunc: controller.enqueueStorageClass,
 	})
-
-	csiDriverInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.handlerCSIDriver,
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			return
-		},
-		DeleteFunc: controller.handlerCSIDriver,
-	})
-
 	return controller
+}
+
+func (c *StorageCapabilityController) csiWatcherHandler(driverName string) {
+	storageClasses, err := c.storageClassLister.List(labels.Everything())
+	if err != nil {
+		klog.Error("list StorageClass error when handler csi", err)
+		return
+	}
+	for _, storageClass := range storageClasses {
+		if storageClass.Provisioner == driverName {
+			klog.Info("enqueue StorageClass when handler csi ", storageClass)
+			c.enqueueStorageClass(storageClass)
+		}
+	}
 }
 
 func (c *StorageCapabilityController) Start(stopCh <-chan struct{}) error {
@@ -155,6 +155,12 @@ func (c *StorageCapabilityController) Start(stopCh <-chan struct{}) error {
 func (c *StorageCapabilityController) Run(threadCnt int, stopCh <-chan struct{}) error {
 	defer utilruntime.HandleCrash()
 	defer c.workQueue.ShutDown()
+	defer func() {
+		err := c.csiWatcher.Stop()
+		if err != nil {
+			klog.Error("csi watcher stop error:", err)
+		}
+	}()
 
 	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
@@ -162,7 +168,6 @@ func (c *StorageCapabilityController) Run(threadCnt int, stopCh <-chan struct{})
 		c.storageClassCapabilitySynced,
 		c.provisionerCapabilitySynced,
 		c.storageClassSynced,
-		c.csiDriverSynced,
 	}
 
 	if c.snapshotAllowed() {
@@ -176,25 +181,16 @@ func (c *StorageCapabilityController) Run(threadCnt int, stopCh <-chan struct{})
 	for i := 0; i < threadCnt; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
+
+	err := c.csiWatcher.Start()
+	if err != nil {
+		return err
+	}
+
 	klog.Info("Started workers")
 	<-stopCh
 	klog.Info("Shutting down workers")
 	return nil
-}
-
-func (c *StorageCapabilityController) handlerCSIDriver(obj interface{}) {
-	csiDriver := obj.(*storagev1beta1.CSIDriver)
-	storageClasses, err := c.storageClassLister.List(labels.Everything())
-	if err != nil {
-		klog.Error("list StorageClass error when handler csiDriver", err)
-		return
-	}
-	for _, storageClass := range storageClasses {
-		if storageClass.Provisioner == csiDriver.Name {
-			klog.Info("enqueue StorageClass when handler csiDriver", storageClass)
-			c.enqueueStorageClass(storageClass)
-		}
-	}
 }
 
 func (c *StorageCapabilityController) enqueueStorageClass(obj interface{}) {
@@ -393,14 +389,14 @@ func (c *StorageCapabilityController) nonCSICapability(provisioner string) (*cap
 }
 
 func (c *StorageCapabilityController) getCapabilitySpec(storageClass *storagev1.StorageClass) (*capability.StorageClassCapabilitySpec, error) {
-	isCsi, err := c.isCSIStorage(storageClass.Provisioner)
-	if err != nil {
-		return nil, err
-	}
+	var (
+		capabilitySpec *capability.StorageClassCapabilitySpec
+		err            error
+	)
 
-	var capabilitySpec *capability.StorageClassCapabilitySpec
+	isCsi := c.isCSIStorage(storageClass.Provisioner)
 	if isCsi {
-		capabilitySpec, err = csiCapability(c.csiAddressGetter(storageClass.Provisioner))
+		capabilitySpec, err = csiCapability(c.csiAddress(storageClass.Provisioner))
 	} else {
 		capabilitySpec, err = c.nonCSICapability(storageClass.Provisioner)
 	}
@@ -421,20 +417,12 @@ func (c *StorageCapabilityController) getCapabilitySpec(storageClass *storagev1.
 	return capabilitySpec, nil
 }
 
-func (c *StorageCapabilityController) isCSIStorage(provisioner string) (bool, error) {
-	_, err := c.csiDriverLister.Get(provisioner)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
+func (c *StorageCapabilityController) isCSIStorage(provisioner string) bool {
+	return fileExist(c.csiAddress(provisioner))
 }
 
-// this is used for test of CSIDriver on windows
-func (c *StorageCapabilityController) setCSIAddressGetter(getter csiAddressGetter) {
-	c.csiAddressGetter = getter
+func (c *StorageCapabilityController) csiAddress(provisioner string) string {
+	return fmt.Sprintf(c.pluginPath+"/%s/csi.sock", provisioner)
 }
 
 func (c *StorageCapabilityController) snapshotAllowed() bool {
@@ -454,10 +442,11 @@ func SnapshotSupported(discoveryInterface discovery.DiscoveryInterface) bool {
 	return ver.AtLeast(minVer)
 }
 
-func csiAddress(provisioner string) string {
-	return fmt.Sprintf(csiAddressFormat, provisioner)
-}
-
 func getProvisionerCapabilityName(provisioner string) string {
 	return strings.NewReplacer(".", "-", "/", "-").Replace(provisioner)
+}
+
+func fileExist(name string) bool {
+	_, err := os.Stat(name)
+	return !os.IsNotExist(err)
 }
